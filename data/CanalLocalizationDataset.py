@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Dataset for dual-headed level-specific spinal canal localization.
+Dataset for spinal canal localization (coordinates prediction).
 """
 
 import os
@@ -19,8 +19,8 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
-class DualHeadCanalDataset(Dataset):
-    """Dataset for dual-headed level-specific spinal canal localization."""
+class CanalLocalizationDataset(Dataset):
+    """Dataset for spinal canal localization - focused on coordinate prediction."""
     
     def __init__(
         self,
@@ -32,8 +32,7 @@ class DualHeadCanalDataset(Dataset):
         transform = None,
         seed: int = 42,
         sigma: float = 5.0,  # Gaussian sigma for heatmaps
-        include_negatives: bool = True,  # Whether to include negative examples
-        negative_ratio: float = 0.2  # Ratio of negative examples to include
+        only_positive_samples: bool = True  # Only include slices with annotations
     ):
         """
         Initialize the dataset.
@@ -47,8 +46,7 @@ class DualHeadCanalDataset(Dataset):
             transform: Albumentations transforms
             seed: Random seed
             sigma: Sigma for Gaussian heatmaps
-            include_negatives: Whether to include negative examples
-            negative_ratio: Ratio of negative examples to include
+            only_positive_samples: Only include slices with annotations
         """
         self.data_dir = data_dir
         self.mode = mode
@@ -56,8 +54,7 @@ class DualHeadCanalDataset(Dataset):
         self.transform = transform
         self.seed = seed
         self.sigma = sigma
-        self.include_negatives = include_negatives
-        self.negative_ratio = negative_ratio
+        self.only_positive_samples = only_positive_samples
         
         # Define level names and indices
         self.level_names = ["L1/L2", "L2/L3", "L3/L4", "L4/L5", "L5/S1"]
@@ -79,24 +76,14 @@ class DualHeadCanalDataset(Dataset):
     
     def _create_samples(self) -> List[Dict]:
         """
-        Create dataset samples with proper balance of positive and negative examples.
-        
-        Positive samples: Slices that are annotated as the optimal view for a specific level
-        Negative samples: All other slices that aren't the optimal view for that level
-        
-        The negative_ratio parameter controls how many negative samples to include
-        relative to the number of positive samples.
+        Create dataset samples, focusing only on slices with annotations.
         
         Returns:
             List of sample dictionaries
         """
-        positive_samples = []
-        negative_samples = []
+        samples = []
         
-        # Track which slices are optimal for which levels
-        optimal_slices = {}  # (study_id, series_id, level) -> set of optimal instance numbers
-        
-        # First pass: collect all optimal (annotated) slices and create positive samples
+        # Process each study/series/level combination
         for study_id, study_data in self.canal_slices.items():
             for series_id, series_data in study_data.items():
                 for level, level_data in series_data.items():
@@ -105,13 +92,23 @@ class DualHeadCanalDataset(Dataset):
                         
                     level_idx = self.level_to_idx[level]
                     
-                    # Track optimal slices for this study/series/level
-                    key = (study_id, series_id, level)
-                    optimal_slices[key] = set(level_data['instances'])
-                    
                     # Create positive samples from annotated slices
                     for idx, instance_number in enumerate(level_data['instances']):
+                        # Check if file exists
+                        file_path = os.path.join(
+                            self.data_dir, 
+                            study_id, 
+                            series_id, 
+                            f"{instance_number}.dcm"
+                        )
+                        
+                        if not os.path.exists(file_path):
+                            continue
+                            
+                        # Get coordinates
                         x, y = level_data['coordinates'][idx]
+                        
+                        # Create sample
                         sample = {
                             'study_id': study_id,
                             'series_id': series_id,
@@ -119,89 +116,29 @@ class DualHeadCanalDataset(Dataset):
                             'level': level,
                             'level_idx': level_idx,
                             'x': x,
-                            'y': y,
-                            'level_present': 1.0,  # Optimal view
-                            'is_optimal': True
+                            'y': y
                         }
-                        positive_samples.append(sample)
-        
-        # Second pass: find all slices in each series to create negative samples
-        for study_id, study_data in self.canal_slices.items():
-            for series_id, series_data in study_data.items():
-                # Get a list of all levels in this series
-                levels_in_series = [l for l in series_data.keys() if l in self.level_names]
-                
-                # Get a list of all instance numbers in this series
-                all_instances = set()
-                
-                # Try to get instances by scanning directory first (more comprehensive)
-                series_dir = os.path.join(self.data_dir, study_id, series_id)
-                if os.path.exists(series_dir):
-                    dicom_files = [f for f in os.listdir(series_dir) if f.endswith('.dcm')]
-                    for f in dicom_files:
-                        try:
-                            instance_num = int(f.split('.')[0])
-                            all_instances.add(instance_num)
-                        except:
-                            pass
-                
-                # If directory scan failed or found no instances, fall back to annotation data
-                if not all_instances:
-                    for level, level_data in series_data.items():
-                        if level in self.level_names:
-                            all_instances.update(level_data['instances'])
-                
-                # Create negative samples for each level
-                for level in levels_in_series:
-                    level_idx = self.level_to_idx[level]
-                    optimal_insts = optimal_slices.get((study_id, series_id, level), set())
-                    
-                    # For each instance that is not optimal for this level, create a negative sample
-                    for inst in all_instances:
-                        if inst not in optimal_insts:
-                            sample = {
-                                'study_id': study_id,
-                                'series_id': series_id,
-                                'instance_number': inst,
-                                'level': level,
-                                'level_idx': level_idx,
-                                'x': -1,  # No valid coordinates
-                                'y': -1,
-                                'level_present': 0.0,  # Not optimal
-                                'is_optimal': False
-                            }
-                            negative_samples.append(sample)
-        
-        # Apply negative_ratio to control the balance between positive and negative examples
-        if self.negative_ratio > 0:
-            # Calculate how many negative samples to keep based on ratio
-            target_neg_count = int(len(positive_samples) * self.negative_ratio)
-            
-            # If we have more negatives than the target, randomly subsample
-            if len(negative_samples) > target_neg_count:
-                # Set random seed for reproducibility
-                random.seed(self.seed)
-                negative_samples = random.sample(negative_samples, target_neg_count)
-                
-            # Log the subsampling
-            original_count = len(negative_samples)
-            print(f"Subsampled negative examples: {len(negative_samples)}/{original_count} " 
-                  f"(target ratio: {self.negative_ratio})")
-        
-        # Combine positive and negative samples
-        all_samples = positive_samples + negative_samples
+                        samples.append(sample)
         
         # Shuffle samples
         random.seed(self.seed)
-        random.shuffle(all_samples)
+        random.shuffle(samples)
         
-        # Log the balance
-        positive_count = len(positive_samples)
-        negative_count = len(negative_samples)
-        print(f"Dataset balance: {positive_count} positive, {negative_count} negative "
-              f"({negative_count/(positive_count+negative_count):.2%} negative)")
+        # Log the sample count
+        print(f"Localization Dataset: {len(samples)} samples")
         
-        return all_samples
+        # Log level distribution
+        level_counts = {}
+        for sample in samples:
+            level = sample['level']
+            if level not in level_counts:
+                level_counts[level] = 0
+            level_counts[level] += 1
+        
+        for level, count in level_counts.items():
+            print(f"  Level {level}: {count} samples")
+        
+        return samples
     
     def _split_dataset(self, split_ratio: float) -> None:
         """
@@ -253,13 +190,13 @@ class DualHeadCanalDataset(Dataset):
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
                 A.Normalize(mean=[0.5], std=[0.5]),
                 ToTensorV2(),
-            ])
+            ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
         else:
             return A.Compose([
                 A.Resize(height=self.target_size[0], width=self.target_size[1]),
                 A.Normalize(mean=[0.5], std=[0.5]),
                 ToTensorV2(),
-            ])
+            ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
     
     def _load_dicom(self, study_id: str, series_id: str, instance_number: int) -> np.ndarray:
         """
@@ -346,7 +283,7 @@ class DualHeadCanalDataset(Dataset):
             idx: Index
             
         Returns:
-            Dictionary with image and target heatmaps
+            Dictionary with image and target heatmap
         """
         # Get sample
         sample = self.samples[idx]
@@ -361,51 +298,55 @@ class DualHeadCanalDataset(Dataset):
         # Get original image dimensions
         orig_height, orig_width = image.shape[:2]
         
-        # For positive examples, create a heatmap
-        if sample['level_present'] > 0.5:  # Positive example
-            # Create heatmap at original resolution
-            heatmap = self._create_heatmap(
-                image_shape=(orig_height, orig_width),
-                x=sample['x'],
-                y=sample['y']
-            )
-            
-            # Store original coordinates
-            orig_x, orig_y = sample['x'], sample['y']
-        else:  # Negative example
-            # Create a blank heatmap
-            heatmap = np.zeros((orig_height, orig_width), dtype=np.float32)
-            
-            # No valid coordinates for negative examples
-            orig_x, orig_y = -1, -1
+        # Get coordinates
+        orig_x, orig_y = sample['x'], sample['y']
+        
+        # Create heatmap at original resolution
+        heatmap = self._create_heatmap(
+            image_shape=(orig_height, orig_width),
+            x=orig_x,
+            y=orig_y
+        )
         
         # Apply transforms to both image and heatmap
+        # Also transform keypoints if using coordinate-based transforms
+        keypoints = [(orig_x, orig_y)]
+        
         if self.transform:
-            transformed = self.transform(image=image, mask=heatmap)
+            transformed = self.transform(
+                image=image, 
+                mask=heatmap,
+                keypoints=keypoints
+            )
             image = transformed['image']
             heatmap = transformed['mask']
+            
+            # Get transformed coordinates if available
+            if 'keypoints' in transformed and transformed['keypoints']:
+                scaled_x, scaled_y = transformed['keypoints'][0]
+            else:
+                # Calculate scaled coordinates manually
+                x_scale = self.target_size[1] / orig_width
+                y_scale = self.target_size[0] / orig_height
+                scaled_x = orig_x * x_scale
+                scaled_y = orig_y * y_scale
         else:
             # Manual conversion to tensor
             image = torch.tensor(image.transpose(2, 0, 1), dtype=torch.float32)
             heatmap = torch.tensor(heatmap, dtype=torch.float32)
-        
-        # Calculate scaled coordinates for the target size (for positive examples only)
-        if sample['level_present'] > 0.5:
+            
+            # Calculate scaled coordinates
             x_scale = self.target_size[1] / orig_width
             y_scale = self.target_size[0] / orig_height
-            
             scaled_x = orig_x * x_scale
             scaled_y = orig_y * y_scale
-        else:
-            scaled_x, scaled_y = -1, -1
         
         # Return dictionary
         return {
             'image': image,
-            'heatmap': heatmap,
+            'heatmap': heatmap.unsqueeze(0),  # Add channel dimension [1, H, W]
             'level_idx': sample['level_idx'],
             'level': sample['level'],
-            'level_present': torch.tensor([sample['level_present']], dtype=torch.float32),
             'study_id': sample['study_id'],
             'series_id': sample['series_id'],
             'instance_number': sample['instance_number'],
@@ -415,8 +356,8 @@ class DualHeadCanalDataset(Dataset):
         }
 
 
-class DualHeadCanalDataModule:
-    """Data module for dual-headed level-specific spinal canal localization."""
+class CanalLocalizationDataModule:
+    """Data module for spinal canal localization."""
     
     def __init__(
         self,
@@ -427,8 +368,7 @@ class DualHeadCanalDataModule:
         target_size: Tuple[int, int] = (128, 128),
         split_ratio: float = 0.8,
         seed: int = 42,
-        include_negatives: bool = True,
-        negative_ratio: float = 0.2
+        only_positive_samples: bool = True
     ):
         """
         Initialize the data module.
@@ -441,8 +381,7 @@ class DualHeadCanalDataModule:
             target_size: Target image size
             split_ratio: Ratio of training data
             seed: Random seed
-            include_negatives: Whether to include negative examples
-            negative_ratio: Ratio of negative examples to include
+            only_positive_samples: Only include slices with annotations
         """
         self.data_dir = data_dir
         self.canal_slices_file = canal_slices_file
@@ -451,8 +390,7 @@ class DualHeadCanalDataModule:
         self.target_size = target_size
         self.split_ratio = split_ratio
         self.seed = seed
-        self.include_negatives = include_negatives
-        self.negative_ratio = negative_ratio
+        self.only_positive_samples = only_positive_samples
         
         # Training transforms
         self.train_transform = A.Compose([
@@ -461,19 +399,19 @@ class DualHeadCanalDataModule:
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
             A.Normalize(mean=[0.5], std=[0.5]),
             ToTensorV2(),
-        ])
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
         
         # Validation transforms
         self.val_transform = A.Compose([
             A.Resize(height=self.target_size[0], width=self.target_size[1]),
             A.Normalize(mean=[0.5], std=[0.5]),
             ToTensorV2(),
-        ])
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
     
     def setup(self):
         """Set up datasets."""
         # Create datasets
-        self.train_dataset = DualHeadCanalDataset(
+        self.train_dataset = CanalLocalizationDataset(
             data_dir=self.data_dir,
             canal_slices_file=self.canal_slices_file,
             mode="train",
@@ -481,11 +419,10 @@ class DualHeadCanalDataModule:
             target_size=self.target_size,
             transform=self.train_transform,
             seed=self.seed,
-            include_negatives=self.include_negatives,
-            negative_ratio=self.negative_ratio
+            only_positive_samples=self.only_positive_samples
         )
         
-        self.val_dataset = DualHeadCanalDataset(
+        self.val_dataset = CanalLocalizationDataset(
             data_dir=self.data_dir,
             canal_slices_file=self.canal_slices_file,
             mode="val",
@@ -493,11 +430,10 @@ class DualHeadCanalDataModule:
             target_size=self.target_size,
             transform=self.val_transform,
             seed=self.seed,
-            include_negatives=self.include_negatives,
-            negative_ratio=self.negative_ratio
+            only_positive_samples=self.only_positive_samples
         )
         
-        self.test_dataset = DualHeadCanalDataset(
+        self.test_dataset = CanalLocalizationDataset(
             data_dir=self.data_dir,
             canal_slices_file=self.canal_slices_file,
             mode="test",
@@ -505,29 +441,13 @@ class DualHeadCanalDataModule:
             target_size=self.target_size,
             transform=self.val_transform,
             seed=self.seed,
-            include_negatives=self.include_negatives,
-            negative_ratio=self.negative_ratio
+            only_positive_samples=self.only_positive_samples
         )
         
         # Print dataset statistics
-        print(f"Train dataset: {len(self.train_dataset)} samples")
-        print(f"Validation dataset: {len(self.val_dataset)} samples")
-        print(f"Test dataset: {len(self.test_dataset)} samples")
-        
-        # Print level distribution in training set
-        level_counts = {level: {'positive': 0, 'negative': 0} 
-                       for level in self.train_dataset.level_names}
-        
-        for sample in self.train_dataset.samples:
-            level = sample['level']
-            if sample['level_present'] > 0.5:
-                level_counts[level]['positive'] += 1
-            else:
-                level_counts[level]['negative'] += 1
-        
-        print("Training set level distribution:")
-        for level, counts in level_counts.items():
-            print(f"  {level}: {counts['positive']} positive, {counts['negative']} negative samples")
+        print(f"Localization Train dataset: {len(self.train_dataset)} samples")
+        print(f"Localization Validation dataset: {len(self.val_dataset)} samples")
+        print(f"Localization Test dataset: {len(self.test_dataset)} samples")
     
     def train_dataloader(self):
         """Get training dataloader."""

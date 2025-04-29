@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-headed model architecture for spinal canal localization.
+Dedicated localization model architecture for spinal canal localization.
 """
 
 import torch
@@ -12,13 +12,10 @@ import torchvision.models as models
 from typing import Dict, List, Tuple, Optional, Union, Any
 
 
-class DualHeadCanalModel(nn.Module):
+class SpinalCanalLocalizationModel(nn.Module):
     """
-    Dual-headed model for level-specific spinal canal localization.
-    
-    Each level has:
-    1. A classification head to determine if the level is present in the slice
-    2. A localization head to generate a heatmap for the level's position
+    Model focused solely on localizing the spinal canal at different levels.
+    This is a refined version of the localization part from the dual-headed model.
     """
     
     def __init__(
@@ -106,34 +103,18 @@ class DualHeadCanalModel(nn.Module):
                 nn.Conv2d(16, 1, kernel_size=1)
             )
             self.localization_decoders.append(decoder)
-        
-        # Create classification heads for each level
-        self.classification_heads = nn.ModuleList()
-        
-        for _ in range(self.num_levels):
-            # Global average pooling followed by MLP for classification
-            classifier = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),  # Global average pooling
-                nn.Flatten(),
-                nn.Linear(self.feature_size, 256),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(256, 1)  # Binary classification: is this level present?
-            )
-            self.classification_heads.append(classifier)
     
-    def forward(self, x, level_idx=None, return_classifications=True):
+    def forward(self, x, level_idx=None):
         """
         Forward pass.
         
         Args:
             x: Input tensor [B, C, H, W]
             level_idx: Index of level to predict (None means predict all levels)
-            return_classifications: Whether to return classification scores
             
         Returns:
-            If level_idx is None: Dictionary of results for each level
-            If level_idx is specified: Tuple of (heatmap, classification_score)
+            If level_idx is None: Dictionary of heatmaps for each level
+            If level_idx is specified: Heatmap for the specified level
         """
         # Extract features using shared backbone
         features = self.encoder(x)
@@ -141,14 +122,7 @@ class DualHeadCanalModel(nn.Module):
         if level_idx is not None:
             # Get localization output for specific level
             heatmap = self.localization_decoders[level_idx](features)
-            
-            # Get classification output for specific level
-            classification = self.classification_heads[level_idx](features)
-            
-            if return_classifications:
-                return heatmap, classification
-            else:
-                return heatmap
+            return heatmap
         else:
             # Generate outputs for all levels
             results = {}
@@ -156,58 +130,40 @@ class DualHeadCanalModel(nn.Module):
             for i in range(self.num_levels):
                 # Get localization output
                 heatmap = self.localization_decoders[i](features)
-                
-                # Get classification output
-                classification = self.classification_heads[i](features)
-                
-                results[f"level_{i}"] = {
-                    "heatmap": heatmap,
-                    "classification": classification
-                }
+                results[f"level_{i}"] = heatmap
             
             return results
     
     def forward_all_levels(self, x, apply_sigmoid=False):
         """
-        Forward pass that returns tensors with all level predictions stacked.
+        Forward pass that returns tensor with all level heatmaps stacked.
         
         Args:
             x: Input tensor [B, C, H, W]
             apply_sigmoid: Whether to apply sigmoid to outputs
             
         Returns:
-            Tuple of (heatmaps, classifications)
-            - heatmaps: Tensor with heatmaps for all levels [B, num_levels, H, W]
-            - classifications: Tensor with classification scores [B, num_levels]
+            Tensor with heatmaps for all levels [B, num_levels, H, W]
         """
         # Extract features using shared backbone
         features = self.encoder(x)
         
         # Generate heatmaps for all levels
         heatmaps = []
-        classifications = []
         
         for i in range(self.num_levels):
             # Get localization output
             heatmap = self.localization_decoders[i](features)
             heatmaps.append(heatmap)
-            
-            # Get classification output
-            classification = self.classification_heads[i](features)
-            classifications.append(classification)
         
         # Stack along channel dimension for heatmaps
         stacked_heatmaps = torch.cat(heatmaps, dim=1)
         
-        # Stack along feature dimension for classifications
-        stacked_classifications = torch.cat(classifications, dim=1)
-        
         # Apply sigmoid if requested
         if apply_sigmoid:
             stacked_heatmaps = torch.sigmoid(stacked_heatmaps)
-            stacked_classifications = torch.sigmoid(stacked_classifications)
         
-        return stacked_heatmaps, stacked_classifications
+        return stacked_heatmaps
     
     def get_level_name(self, level_idx):
         """Get name of a specific level."""

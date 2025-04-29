@@ -1,22 +1,36 @@
-# Configuration for Spinal Canal Localization
+# Configuration for Combined Spinal Canal Models
 
 # Data configuration
 data:
-  data_dir: "/mnt/c/users/fabio/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_images_small"  
-  coordinates_csv: "/mnt/c/users/fabio/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_label_coordinates.csv" 
-  series_csv: "/mnt/c/users/fabio/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_series_descriptions.csv" 
+  data_dir: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_images"  
+  coordinates_csv: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_label_coordinates.csv" 
+  series_csv: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_series_descriptions.csv" 
   batch_size: 8
   num_workers: 4
-  target_size: [128, 128]
+  target_size: [64, 64]
   split_ratio: 0.8
   seed: 42
 
 # Model configuration
 model:
+  # Shared model parameters
   backbone: "resnet18"  # Options: "resnet18", "resnet34", "resnet50"
   pretrained: true
-  dropout_rate: 0.2
   in_channels: 3
+  
+  # Slice classifier specific parameters
+  slice_classifier:
+    dropout_rate: 0.5
+    hard_negative_mining: true
+    focal_loss: true
+    pos_weight: 3.0
+  
+  # Canal localizer specific parameters
+  canal_localizer:
+    dropout_rate: 0.2
+    bce_weight: 1.0
+    dice_weight: 1.0
+    focal_weight: 0.5
 
 # Training configuration
 training:
@@ -25,14 +39,10 @@ training:
   checkpoint_interval: 5
   early_stopping_patience: 15
   
-  # Loss function 
-  loss:
-    pos_weight: 10.0  # Weight for positive examples
-  
   # Optimizer
   optimizer:
     name: "adam"
-    lr: 0.001
+    lr: 0.0001
     weight_decay: 0.0001
   
   # Learning rate scheduler
@@ -43,5 +53,7 @@ training:
 
 # Inference configuration
 inference:
-  checkpoint_path: "best_model.pth"
-  confidence_threshold: 0.5
+  classifier_checkpoint: "best_slice_classifier.pth"
+  localizer_checkpoint: "best_localizer.pth"
+  classification_threshold: 0.2
+  top_n_slices: 3
