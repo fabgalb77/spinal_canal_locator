@@ -10,10 +10,109 @@ import torch.nn as nn
 import torchvision.models as models
 from typing import Dict, List, Tuple, Optional, Union, Any
 
+class SimpleSpineModel(nn.Module):
+    """
+    Extremely simplified model for spine slice classification to prevent overfitting.
+    """
+    def __init__(
+        self,
+        in_channels: int = 1,
+        dropout_rate: float = 0.5,
+        num_levels: int = 5
+    ):
+        """Initialize the model."""
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.num_levels = num_levels
+        
+        # Define level names for reference
+        self.level_names = ["L1/L2", "L2/L3", "L3/L4", "L4/L5", "L5/S1"]
+        
+        # Very simple feature extractor with strong regularization
+        self.encoder = nn.Sequential(
+            # First layer (dramatically simplified)
+            nn.Conv2d(in_channels, 16, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate),
+            
+            # Second layer
+            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate),
+            
+            # Final layer
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
+        )
+        
+        # Create simple classification heads for each level
+        self.classification_heads = nn.ModuleList()
+        
+        for _ in range(self.num_levels):
+            classifier = nn.Sequential(
+                nn.Dropout(dropout_rate),
+                nn.Linear(64, 1)  # Single output per level
+            )
+            self.classification_heads.append(classifier)
+    
+    def forward(self, x, level_idx=None):
+        """Forward pass."""
+        # Extract features using shared backbone
+        features = self.encoder(x)
+        
+        if level_idx is not None:
+            # Get classification output for specific level
+            classification = self.classification_heads[level_idx](features)
+            return classification
+        else:
+            # Generate classification outputs for all levels
+            classifications = {}
+            
+            for i in range(self.num_levels):
+                # Get classification output
+                classification = self.classification_heads[i](features)
+                classifications[f"level_{i}"] = classification
+            
+            return classifications
+    
+    def forward_all_levels(self, x, apply_sigmoid=False):
+        """Forward pass that returns tensor with all level predictions stacked."""
+        # Extract features using shared backbone
+        features = self.encoder(x)
+        
+        # Generate classification scores for all levels
+        classifications = []
+        
+        for i in range(self.num_levels):
+            # Get classification output
+            classification = self.classification_heads[i](features)
+            classifications.append(classification)
+        
+        # Stack along feature dimension for classifications
+        stacked_classifications = torch.cat(classifications, dim=1)
+        
+        # Apply sigmoid if requested
+        if apply_sigmoid:
+            stacked_classifications = torch.sigmoid(stacked_classifications)
+        
+        return stacked_classifications
+    
+    def get_level_name(self, level_idx):
+        """Get name of a specific level."""
+        return self.level_names[level_idx]
+
 
 class SliceClassificationModel(nn.Module):
     """
-    Model for classifying which slice best represents a specific spinal level.
+    Simplified model for classifying which slice best represents a specific spinal level.
     """
     
     def __init__(
@@ -21,19 +120,10 @@ class SliceClassificationModel(nn.Module):
         backbone: str = "resnet18",
         pretrained: bool = True,
         in_channels: int = 3,
-        dropout_rate: float = 0.2,
+        dropout_rate: float = 0.3,
         num_levels: int = 5
     ):
-        """
-        Initialize the model.
-        
-        Args:
-            backbone: Backbone architecture ("resnet18", "resnet34", "resnet50")
-            pretrained: Whether to use pretrained weights
-            in_channels: Number of input channels
-            dropout_rate: Dropout rate
-            num_levels: Number of spinal levels to detect
-        """
+        """Initialize the model."""
         super().__init__()
         
         self.backbone = backbone
@@ -43,7 +133,7 @@ class SliceClassificationModel(nn.Module):
         # Define level names for reference
         self.level_names = ["L1/L2", "L2/L3", "L3/L4", "L4/L5", "L5/S1"]
         
-        # Create backbone network
+        # Create backbone network with modified first layer if needed
         if backbone == "resnet18":
             base_model = models.resnet18(pretrained=pretrained)
             self.feature_size = 512
@@ -65,47 +155,24 @@ class SliceClassificationModel(nn.Module):
         else:
             self.encoder = nn.Sequential(*list(base_model.children())[:-2])  # Remove final FC layer
         
-        # Create classification heads for each level
+        # Create simplified classification heads for each level
         self.classification_heads = nn.ModuleList()
         
         for _ in range(self.num_levels):
-            # Stronger classifier architecture with more layers and attention mechanism
+            # Much simpler classifier - just pooling and a single fully connected layer
             classifier = nn.Sequential(
-                # Spatial attention mechanism
-                nn.Conv2d(self.feature_size, self.feature_size, kernel_size=1),
-                nn.Sigmoid(),
-                
                 # Global average pooling
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
-
-                # MLP with more capacity
-                nn.Linear(self.feature_size, 512),
-                nn.LayerNorm(512),  # LayerNorm works with batch size 1
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
                 
-                nn.Linear(512, 256),
-                nn.LayerNorm(256),  # LayerNorm works with batch size 1
-                nn.ReLU(),
+                # Simple dropout + single linear layer
                 nn.Dropout(dropout_rate),
-                
-                nn.Linear(256, 1)  # Binary classification: is this the optimal slice?
+                nn.Linear(self.feature_size, 1)
             )
             self.classification_heads.append(classifier)
     
     def forward(self, x, level_idx=None):
-        """
-        Forward pass.
-        
-        Args:
-            x: Input tensor [B, C, H, W]
-            level_idx: Index of level to predict (None means predict all levels)
-            
-        Returns:
-            If level_idx is None: Dictionary of classification scores for each level
-            If level_idx is specified: Classification score for the specified level
-        """
+        """Forward pass."""
         # Extract features using shared backbone
         features = self.encoder(x)
         
@@ -125,16 +192,7 @@ class SliceClassificationModel(nn.Module):
             return classifications
     
     def forward_all_levels(self, x, apply_sigmoid=False):
-        """
-        Forward pass that returns tensor with all level predictions stacked.
-        
-        Args:
-            x: Input tensor [B, C, H, W]
-            apply_sigmoid: Whether to apply sigmoid to outputs
-            
-        Returns:
-            Tensor with classification scores [B, num_levels]
-        """
+        """Forward pass that returns tensor with all level predictions stacked."""
         # Extract features using shared backbone
         features = self.encoder(x)
         

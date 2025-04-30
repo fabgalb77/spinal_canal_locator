@@ -2,7 +2,7 @@
 
 # Data configuration
 data:
-  data_dir: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_images"  
+  data_dir: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_images_small"  
   coordinates_csv: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_label_coordinates.csv" 
   series_csv: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_series_descriptions.csv" 
   batch_size: 8
