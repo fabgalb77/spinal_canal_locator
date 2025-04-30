@@ -194,7 +194,6 @@ class LocalizationLoss(nn.Module):
         focal_weight: float = 0.5,
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
-        pos_weight: Optional[float] = None
     ):
         """
         Initialize combined loss.
@@ -205,20 +204,14 @@ class LocalizationLoss(nn.Module):
             focal_weight: Weight for Focal loss
             focal_gamma: Gamma parameter for Focal loss
             focal_alpha: Alpha parameter for Focal loss
-            pos_weight: Weight for positive examples
         """
         super().__init__()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight
         
-        # Initialize losses
-        if pos_weight is not None:
-            self.bce_loss = nn.BCEWithLogitsLoss(
-                pos_weight=torch.tensor(pos_weight)
-            )
-        else:
-            self.bce_loss = nn.BCEWithLogitsLoss()
+
+        self.bce_loss = nn.BCEWithLogitsLoss()
             
         self.focal_loss = FocalLoss(
             alpha=focal_alpha,
@@ -685,7 +678,6 @@ def main():
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
         focal_weight=args.focal_weight,
-        pos_weight=config['training']['loss'].get('pos_weight', None)
     )
     
     # Create optimizer
