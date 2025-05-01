@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from data.preprocessing import create_processed_dataset, setup_logger
 from data.CanalLocalizationDataset import CanalLocalizationDataset, CanalLocalizationDataModule
 from models.SpinalCanalLocalizationModel import SpinalCanalLocalizationModel
+from models.SpinalCanalHourglass import StackedHourglassNetwork, create_spinal_canal_hourglass
 
 
 def set_seed(seed: int) -> None:
@@ -82,150 +83,44 @@ def parse_args():
         help="Force preprocessing of data"
     )
     
-    parser.add_argument(
-        "--bce_weight",
-        type=float,
-        default=1.0,
-        help="Weight for BCE loss"
-    )
-    
-    parser.add_argument(
-        "--dice_weight",
-        type=float,
-        default=1.0,
-        help="Weight for Dice loss"
-    )
-    
-    parser.add_argument(
-        "--focal_weight",
-        type=float,
-        default=0.5,
-        help="Weight for Focal loss"
-    )
-    
     return parser.parse_args()
 
 
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for dealing with class imbalance.
-    """
-    
-    def __init__(
-        self, 
-        alpha: float = 0.25, 
-        gamma: float = 2.0, 
-        reduction: str = "mean"
-    ):
-        """
-        Initialize Focal Loss.
-        
-        Args:
-            alpha: Weighting factor
-            gamma: Focusing parameter
-            reduction: Reduction method
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        self.eps = 1e-6
-    
-    def forward(self, inputs, targets):
-        """Forward pass."""
-        # Apply sigmoid to get probabilities
-        inputs_prob = torch.sigmoid(inputs)
-        inputs_prob = torch.clamp(inputs_prob, self.eps, 1.0 - self.eps)
-        
-        # Calculate BCE
-        bce_loss = F.binary_cross_entropy_with_logits(
-            inputs, targets, reduction="none"
-        )
-        
-        # Apply gamma focusing parameter
-        pt = torch.exp(-bce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
-        
-        # Apply reduction
-        if self.reduction == "mean":
-            return focal_loss.mean()
-        elif self.reduction == "sum":
-            return focal_loss.sum()
-        else:  # 'none'
-            return focal_loss
+class HeatmapMSELoss(nn.Module):
+    """MSE loss with adaptive weighting for landmark heatmaps"""
+    def __init__(self, use_target_weight=True):
+        super(HeatmapMSELoss, self).__init__()
+        self.use_target_weight = use_target_weight
+        self.criterion = nn.MSELoss(reduction='mean')
 
-
-def dice_loss(inputs, targets, smooth=1.0):
-    """
-    Dice loss for segmentation tasks.
-    
-    Args:
-        inputs: Model outputs (logits)
-        targets: Ground truth
-        smooth: Smoothing factor
+    def forward(self, pred, target, target_weight=None):
+        # Ensure everything is float32
+        pred = pred.float()
+        target = target.float()
         
-    Returns:
-        Dice loss
-    """
-    # Apply sigmoid to get probabilities
-    inputs = torch.sigmoid(inputs)
-    
-    # Flatten
-    inputs = inputs.view(-1)
-    targets = targets.view(-1)
-    
-    # Calculate Dice score
-    intersection = (inputs * targets).sum()
-    dice_score = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
-    
-    # Return Dice loss
-    return 1 - dice_score
-
-
-class LocalizationLoss(nn.Module):
-    """
-    Combined loss function for localization task (BCE + Dice + Focal).
-    """
-    
-    def __init__(
-        self, 
-        bce_weight: float = 1.0,
-        dice_weight: float = 1.0,
-        focal_weight: float = 0.5,
-        focal_gamma: float = 2.0,
-        focal_alpha: float = 0.25,
-    ):
-        """
-        Initialize combined loss.
+        batch_size = pred.size(0)
+        num_joints = pred.size(1)
         
-        Args:
-            bce_weight: Weight for BCE loss
-            dice_weight: Weight for Dice loss
-            focal_weight: Weight for Focal loss
-            focal_gamma: Gamma parameter for Focal loss
-            focal_alpha: Alpha parameter for Focal loss
-        """
-        super().__init__()
-        self.bce_weight = bce_weight
-        self.dice_weight = dice_weight
-        self.focal_weight = focal_weight
-        
-
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        # Default weights if none provided
+        if target_weight is None:
+            target_weight = torch.ones(batch_size, num_joints, 
+                                      device=pred.device, dtype=torch.float32)
+        else:
+            target_weight = target_weight.float()
             
-        self.focal_loss = FocalLoss(
-            alpha=focal_alpha,
-            gamma=focal_gamma
-        )
-    
-    def forward(self, inputs, targets):
-        """Forward pass."""
-        bce = self.bce_loss(inputs, targets) * self.bce_weight
-        dice = dice_loss(inputs, targets) * self.dice_weight
-        focal = self.focal_loss(inputs, targets) * self.focal_weight
-        
-        return bce + dice + focal
-
+        loss = 0
+        for i in range(num_joints):
+            heatmap_pred = pred[:, i]
+            heatmap_gt = target[:, i]
+            if self.use_target_weight:
+                loss += self.criterion(
+                    heatmap_pred.mul(target_weight[:, i]),
+                    heatmap_gt.mul(target_weight[:, i])
+                )
+            else:
+                loss += self.criterion(heatmap_pred, heatmap_gt)
+                
+        return loss / num_joints
 
 def train_one_epoch(model, dataloader, optimizer, loss_fn, device, epoch, logger):
     """
@@ -377,6 +272,176 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn, device, epoch, logger
         'level_distances': avg_level_distances,
         'level_median_distances': median_level_distances
     }
+
+def collect_random_samples(dataloader, model, loss_fn, device, num_samples=5, is_training=False):
+    """
+    Collect random samples from dataloader for visualization.
+    
+    Args:
+        dataloader: Data loader to collect samples from
+        model: Trained model
+        loss_fn: Loss function
+        device: Device to use
+        num_samples: Number of random samples per level
+        is_training: Whether this is training mode
+        
+    Returns:
+        Dictionary of all collected samples by level
+    """
+    # Use eval mode for consistent results
+    if not is_training:
+        model.eval()
+    
+    # Dictionary to hold all samples by level
+    all_samples = {i: [] for i in range(5)}
+    
+    # Sample a subset of batches to reduce time
+    # For large datasets, we don't need to process every batch
+    import random
+    batch_subset = min(50, len(dataloader))  # Process at most 50 batches
+    batch_indices = random.sample(range(len(dataloader)), batch_subset)
+    
+    for batch_idx, batch in enumerate(dataloader):
+        # Skip batches not in our subset
+        if batch_idx not in batch_indices:
+            continue
+            
+        # Get data
+        images = batch["image"].to(device)
+        heatmaps = batch["heatmap"].to(device)
+        level_indices = batch["level_idx"].to(device)
+        
+        # Get scaled coordinates
+        scaled_coords = batch["scaled_coordinates"]
+        scaled_x = scaled_coords[0].numpy()
+        scaled_y = scaled_coords[1].numpy()
+        
+        # Process each sample in batch
+        for i in range(len(images)):
+            img = images[i:i+1]
+            target_heatmap = heatmaps[i:i+1]
+            level_idx = level_indices[i].item()
+            
+            # Forward pass
+            with torch.no_grad():
+                pred_heatmap = model(img, level_idx=level_idx)
+                
+                # Calculate prediction and distance
+                pred_heatmap_np = pred_heatmap[0, 0].cpu().numpy()
+                prob_map = 1 / (1 + np.exp(-pred_heatmap_np))  # sigmoid
+                pred_y, pred_x = np.unravel_index(prob_map.argmax(), prob_map.shape)
+                
+                # Get ground truth coordinates
+                gt_x, gt_y = scaled_x[i], scaled_y[i]
+                
+                # Calculate distance
+                distance = np.sqrt((pred_x - gt_x) ** 2 + (pred_y - gt_y) ** 2)
+                
+                # Store sample
+                sample = {
+                    'image': img.cpu(),
+                    'target_heatmap': target_heatmap.cpu(),
+                    'pred_heatmap': pred_heatmap.cpu(),
+                    'pred_prob': prob_map,
+                    'gt_coords': (gt_x, gt_y),
+                    'pred_coords': (pred_x, pred_y),
+                    'distance': distance,
+                    'level_idx': level_idx,
+                    'level_name': batch["level"][i]
+                }
+                all_samples[level_idx].append(sample)
+    
+    return all_samples
+
+def visualize_predictions_multiple(vis_samples_list, save_path, epoch, title_prefix="Validation"):
+    """
+    Visualize multiple samples per level for debugging.
+    Now with smaller font size and without ground truth heatmap.
+    
+    Args:
+        vis_samples_list: List of dictionaries of visualization samples for each level
+        save_path: Path to save visualization
+        epoch: Current epoch
+        title_prefix: Prefix for the title ("Validation" or "Training")
+    """
+    # Count how many levels have samples
+    valid_level_indices = set()
+    for samples in vis_samples_list:
+        valid_level_indices.update([level_idx for level_idx, sample in samples.items() if sample is not None])
+    
+    if not valid_level_indices:
+        return
+    
+    valid_level_indices = sorted(list(valid_level_indices))
+    num_levels = len(valid_level_indices)
+    samples_per_level = len(vis_samples_list)
+    
+    # Create figure with one row per level, and columns for each sample
+    # Each sample gets 2 columns (image with points + pred heatmap)
+    fig, axes = plt.subplots(num_levels, samples_per_level * 2, 
+                             figsize=(samples_per_level * 3.5, num_levels * 2.8))
+    
+    # Handle case with just one level
+    if num_levels == 1:
+        axes = axes.reshape(1, -1)
+    
+    # Set smaller font size for all text elements
+    plt.rcParams.update({'font.size': 8})  # Default font size
+    
+    # Plot samples
+    for row_idx, level_idx in enumerate(valid_level_indices):
+        level_name = None
+        
+        for sample_idx, samples in enumerate(vis_samples_list):
+            if level_idx not in samples or samples[level_idx] is None:
+                # If no sample for this level, leave these columns blank
+                continue
+            
+            sample = samples[level_idx]
+            
+            # Get data
+            img = sample['image'][0].cpu().numpy().transpose(1, 2, 0)
+            img = (img * 0.5) + 0.5  # Denormalize
+            
+            pred_prob = sample['pred_prob']
+            
+            gt_x, gt_y = sample['gt_coords']
+            pred_x, pred_y = sample['pred_coords']
+            distance = sample['distance']
+            level_name = sample['level_name']
+            
+            # Get columns for this sample (2 columns per sample)
+            col_offset = sample_idx * 2
+            
+            # Plot image with points
+            axes[row_idx, col_offset].imshow(img[:, :, 0], cmap='gray')
+            axes[row_idx, col_offset].scatter(gt_x, gt_y, c='r', marker='x', s=60, label='GT')
+            axes[row_idx, col_offset].scatter(pred_x, pred_y, c='b', marker='o', s=60, label='Pred')
+            axes[row_idx, col_offset].set_title(f"Sample {sample_idx+1}, Dist: {distance:.1f}px", fontsize=9)
+            axes[row_idx, col_offset].legend(loc='upper right', fontsize=7)
+            axes[row_idx, col_offset].axis('off')
+            
+            # Plot predicted heatmap (skipping ground truth heatmap)
+            axes[row_idx, col_offset + 1].imshow(pred_prob, cmap='hot')
+            axes[row_idx, col_offset + 1].set_title("Predicted Heatmap", fontsize=9)
+            axes[row_idx, col_offset + 1].axis('off')
+        
+        # Add row label for the level
+        if level_name:
+            axes[row_idx, 0].text(-0.25, 0.5, f"Level {level_name}", 
+                                  va='center', ha='right', transform=axes[row_idx, 0].transAxes,
+                                  fontsize=10, fontweight='bold', rotation=90)
+    
+    # Add overall title with smaller font
+    plt.suptitle(f"{title_prefix} Predictions - Epoch {epoch+1}", fontsize=12)
+    
+    # Save figure with tight layout
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    
+    # Reset font size to default after plotting
+    plt.rcParams.update({'font.size': plt.rcParamsDefault['font.size']})
 
 
 def validate(model, dataloader, loss_fn, device, epoch, logger, visualize=False, save_dir=None):
@@ -620,6 +685,12 @@ def main():
     # Create visualization directory
     vis_dir = os.path.join(output_dir, "visualizations")
     os.makedirs(vis_dir, exist_ok=True)
+
+    # Create additional visualization directories
+    train_debug_dir = os.path.join(output_dir, "visualizations", "train_debug")
+    val_debug_dir = os.path.join(output_dir, "visualizations", "val_debug")
+    os.makedirs(train_debug_dir, exist_ok=True)
+    os.makedirs(val_debug_dir, exist_ok=True)
     
     # Set up logger
     logger = setup_logger("train_localizer", os.path.join(output_dir, "train.log"))
@@ -664,21 +735,24 @@ def main():
     
     # Create model - Specifically for localization
     logger.info("Creating canal localization model...")
+    
+    """
     model = SpinalCanalLocalizationModel(
         backbone=config['model']['backbone'],
         pretrained=config['model']['pretrained'],
         in_channels=config['model']['in_channels'],
         dropout_rate=config['model']['dropout_rate']
     )
+    """
+    
+    #config['debug'] = True
+
+    model = create_spinal_canal_hourglass(config)
     model = model.to(device)
     
     # Create loss function - Specifically for localization
     logger.info("Creating localization loss...")
-    loss_fn = LocalizationLoss(
-        bce_weight=args.bce_weight,
-        dice_weight=args.dice_weight,
-        focal_weight=args.focal_weight,
-    )
+    loss_fn = HeatmapMSELoss()
     
     # Create optimizer
     logger.info("Creating optimizer...")
@@ -723,9 +797,9 @@ def main():
     }
     best_epoch = 0
     patience_counter = 0
-    
+
     for epoch in range(config['training']['num_epochs']):
-        # Train for one epoch
+        # Train for one epoch (original training code)
         train_metrics = train_one_epoch(
             model=model,
             dataloader=data_module.train_dataloader(),
@@ -736,7 +810,7 @@ def main():
             logger=logger
         )
         
-        # Validate
+        # Original validation code
         val_metrics = validate(
             model=model,
             dataloader=data_module.val_dataloader(),
@@ -747,6 +821,71 @@ def main():
             visualize=True,
             save_dir=vis_dir
         )
+        
+        # Additional debugging visualizations
+        if (epoch + 1) % 1 == 0:  # Do this every epoch
+            logger.info("Generating debug visualizations...")
+            
+            # Collect random training samples
+            train_samples = collect_random_samples(
+                dataloader=data_module.train_dataloader(),
+                model=model,
+                loss_fn=loss_fn,
+                device=device,
+                num_samples=5,
+                is_training=True
+            )
+            
+            # Collect random validation samples
+            val_samples = collect_random_samples(
+                dataloader=data_module.val_dataloader(),
+                model=model,
+                loss_fn=loss_fn,
+                device=device,
+                num_samples=5,
+                is_training=False
+            )
+            
+            # Select random samples for each level
+            train_vis_samples = [{i: None for i in range(5)} for _ in range(5)]
+            val_vis_samples = [{i: None for i in range(5)} for _ in range(5)]
+            
+            for level_idx in range(5):
+                # Training samples
+                if train_samples[level_idx]:
+                    selected = random.sample(
+                        train_samples[level_idx], 
+                        min(5, len(train_samples[level_idx]))
+                    )
+                    for i, sample in enumerate(selected):
+                        if i < len(train_vis_samples):
+                            train_vis_samples[i][level_idx] = sample
+                
+                # Validation samples
+                if val_samples[level_idx]:
+                    selected = random.sample(
+                        val_samples[level_idx], 
+                        min(5, len(val_samples[level_idx]))
+                    )
+                    for i, sample in enumerate(selected):
+                        if i < len(val_vis_samples):
+                            val_vis_samples[i][level_idx] = sample
+            
+            visualize_predictions_multiple(
+                train_vis_samples,
+                os.path.join(train_debug_dir, f"train_debug_epoch_{epoch+1}.png"),
+                epoch,
+                "Training"
+            )
+
+            visualize_predictions_multiple(
+                val_vis_samples,
+                os.path.join(val_debug_dir, f"val_debug_epoch_{epoch+1}.png"),
+                epoch,
+                "Validation"
+            )
+            
+            logger.info("Debug visualizations completed")
         
         # Update TensorBoard
         writer.add_scalar("Loss/Train", train_metrics['loss'], epoch)

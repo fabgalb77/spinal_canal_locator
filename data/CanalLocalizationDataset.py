@@ -175,28 +175,7 @@ class CanalLocalizationDataset(Dataset):
             self.samples = [s for s in self.samples if s['study_id'] in test_studies]
         else:  # Use all samples
             pass
-    
-    def _get_default_transforms(self):
-        """
-        Get default data augmentation transforms.
-        
-        Returns:
-            Albumentations transforms
-        """
-        if self.mode == "train":
-            return A.Compose([
-                A.Resize(height=self.target_size[0], width=self.target_size[1]),
-                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=10, p=0.5),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.Normalize(mean=[0.5], std=[0.5]),
-                ToTensorV2(),
-            ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
-        else:
-            return A.Compose([
-                A.Resize(height=self.target_size[0], width=self.target_size[1]),
-                A.Normalize(mean=[0.5], std=[0.5]),
-                ToTensorV2(),
-            ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
     
     def _load_dicom(self, study_id: str, series_id: str, instance_number: int) -> np.ndarray:
         """
@@ -230,9 +209,12 @@ class CanalLocalizationDataset(Dataset):
             # Get pixel array
             image = dicom.pixel_array.astype(np.float32)
             
-            # Normalize to [0, 1]
-            if image.max() > 0:
-                image = image / image.max()
+            # Normalize to [0, 1] properly handling negative values
+            if image.max() > image.min():  # Check there's some variation in the image
+                image = (image - image.min()) / (image.max() - image.min())
+            else:
+                # If image is constant (max = min), set to 0.5
+                image = np.ones_like(image) * 0.5
             
             # Convert to RGB (3 channels)
             if len(image.shape) == 2:
@@ -392,21 +374,67 @@ class CanalLocalizationDataModule:
         self.seed = seed
         self.only_positive_samples = only_positive_samples
         
-        # Training transforms
+        # Updated Training transforms
+        """
         self.train_transform = A.Compose([
             A.Resize(height=self.target_size[0], width=self.target_size[1]),
-            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=10, p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HorizontalFlip(p=0.5),
+            # Replace ShiftScaleRotate with Affine
+            A.Affine(
+                scale=(0.85, 1.15),       # Scale between 85% and 115%
+                translate_percent=(0.2, 0.2),  # Translation up to 20% in either direction
+                rotate=(-20, 20),         # Rotation up to 20 degrees
+                shear=(-5, 5),            # Add slight shearing
+                border_mode=cv2.BORDER_CONSTANT,
+                p=0.9
+            ),
+            
+            # Fix ElasticTransform parameters
+            A.ElasticTransform(
+                alpha=1,
+                sigma=50,
+                p=0.5
+            ),
+            
+            # Keep GridDistortion as is
+            A.GridDistortion(
+                distort_limit=0.1,
+                p=0.5
+            ),
+            
+            # Keep RandomBrightnessContrast as is
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.3,
+                p=0.7
+            ),
+            
+            A.Blur(blur_limit=3, p=0.4),
+            
+            # Keep RandomGamma as is
+            A.RandomGamma(
+                gamma_limit=(80, 120),
+                p=0.5
+            ),
+            
+            # Standard normalization
             A.Normalize(mean=[0.5], std=[0.5]),
             ToTensorV2(),
         ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
-        
+        """
+        self.train_transform = A.Compose([
+            A.Resize(height=self.target_size[0], width=self.target_size[1]),
+            A.Normalize(mean=[0.5], std=[0.5]),
+            ToTensorV2(),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
         # Validation transforms
         self.val_transform = A.Compose([
             A.Resize(height=self.target_size[0], width=self.target_size[1]),
             A.Normalize(mean=[0.5], std=[0.5]),
             ToTensorV2(),
         ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
     
     def setup(self):
         """Set up datasets."""

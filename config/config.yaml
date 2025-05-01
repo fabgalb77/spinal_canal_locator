@@ -2,9 +2,9 @@
 
 # Data configuration
 data:
-  data_dir: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_images"  
-  coordinates_csv: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_label_coordinates.csv" 
-  series_csv: "/mnt/c/users/Fabio Galbusera/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_series_descriptions.csv" 
+  data_dir: "/mnt/c/users/fabio/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_images_minimal"  
+  coordinates_csv: "/mnt/c/users/fabio/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_label_coordinates_minimal.csv" 
+  series_csv: "/mnt/c/users/fabio/Dropbox/RSNA/rsna-2024-lumbar-spine-degenerative-classification/train_series_descriptions_minimal.csv" 
   batch_size: 8
   num_workers: 4
   target_size: [128, 128]
@@ -14,25 +14,29 @@ data:
 # Model configuration
 model:
   # Shared model parameters
-  backbone: "resnet18"  # Options: "resnet18", "resnet34", "resnet50"
+  backbone: "resnet34"  # Options: "resnet18", "resnet34", "resnet50"
   pretrained: true
   in_channels: 3
   dropout_rate: 0.2
   bce_weight: 1.0
   dice_weight: 1.0
   focal_weight: 0.5
+  num_stacks: 2 # Hourglass
+  num_blocks': 4 # Hourglass
+  heatmap_size': 128 # Hourglass
+
 
 # Training configuration
 training:
   output_dir: "./outputs"
-  num_epochs: 100
+  num_epochs: 20
   checkpoint_interval: 5
   early_stopping_patience: 15
   
   # Optimizer
   optimizer:
     name: "adam"
-    lr: 0.0001
+    lr: 0.001
     weight_decay: 0.0001
   
   # Learning rate scheduler
